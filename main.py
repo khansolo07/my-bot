@@ -37,91 +37,121 @@ async def process_mexc_order(data: dict):
             exchange = ccxt.mexc({
                 'apiKey': MEXC_API_KEY,
                 'secret': MEXC_SECRET_KEY,
-                'options': {'defaultType': 'swap'},
+                'options': {
+                    'defaultType': 'swap',
+                },
                 'enableRateLimit': True,
             })
 
             # 1. ПРОВЕРКА: Есть ли УЖЕ открытые позиции по аккаунту?
             all_positions = await exchange.fetch_positions()
             
-            # Фильтруем те, где объем больше нуля (реально открытые сделки)
             active_positions = [
                 p for p in all_positions 
-                if float(p.get('contracts', 0)) > 0 or float(p.get('initialMargin', 0)) > 0
+                if float(p.get('contracts', 0) or pos_info_len(p)) > 0
             ]
 
             if len(active_positions) > 0:
-                print(f"[{raw_symbol}] ПРОПУСК: Депозит уже занят (открыта позиция по {active_positions[0]['symbol']})")
+                print(f"[{raw_symbol}] ПРОПУСК: Депозит уже занят (открыта позиция)")
                 await exchange.close()
                 await asyncio.sleep(DELAY_BETWEEN_ORDERS)
                 return
 
-            # 2. Если открытых позиций нет — проверяем баланс
-            balance = await exchange.fetch_balance()
-            free_usdt = float(balance['USDT']['free'])
+            # 2. Корректное получение свободного баланса USDT на фьючерсах
+            balance = await exchange.fetch_balance({'type': 'swap'})
+            usdt_data = balance.get('USDT', {})
+            free_usdt = float(usdt_data.get('free') or usdt_data.get('total') or 0)
 
-            if free_usdt < 5:  # Меньше $5 — считать свободный депо нулевым
-                print(f"[{raw_symbol}] ПРОПУСК: Недостаточно свободного USDT ({free_usdt} USDT)")
+            if free_usdt < 5:
+                print(f"[{raw_symbol}] ПРОПУСК: Мало USDT на балансе ({free_usdt} USDT)")
                 await exchange.close()
                 await asyncio.sleep(DELAY_BETWEEN_ORDERS)
                 return
 
-            # 3. Получаем актуальную цену
+            # 3. Актуальная цена
             ticker = await exchange.fetch_ticker(symbol_futures)
             entry_price = float(ticker['last'])
 
-            # Расчет маржи (90% от баланса) и объема позиции с плечом 6x
+            # Расчет маржи и объема с плечом 6x
             margin_usdt = free_usdt * MARGIN_PCT
             position_size_usdt = margin_usdt * LEVERAGE
-            amount = round(position_size_usdt / entry_price, 2)
+            
+            # Конвертируем в количество SOL (минимальный шаг округления)
+            amount = round(position_size_usdt / entry_price, 1)
 
             # Дистанция TP/SL по графику с учетом 6-го плеча
             chart_sl_pct = TARGET_MARGIN_RISK / LEVERAGE  # 0.166% по графику
             chart_tp_pct = TARGET_MARGIN_TP / LEVERAGE    # 0.516% по графику
 
-            # 4. Открываем основной ордер и отдельно выставляем TP и SL для MEXC
             if action == "buy":
-                sl_price = round(entry_price * (1 - chart_sl_pct), 4)
-                tp_price = round(entry_price * (1 + chart_tp_pct), 4)
-                order_side = 'buy'
+                sl_price = round(entry_price * (1 - chart_sl_pct), 2)
+                tp_price = round(entry_price * (1 + chart_tp_pct), 2)
+                side = 'buy'
                 close_side = 'sell'
             elif action == "sell":
-                sl_price = round(entry_price * (1 + chart_sl_pct), 4)
-                tp_price = round(entry_price * (1 - chart_tp_pct), 4)
-                order_side = 'sell'
+                sl_price = round(entry_price * (1 + chart_sl_pct), 2)
+                tp_price = round(entry_price * (1 - chart_tp_pct), 2)
+                side = 'sell'
                 close_side = 'buy'
             else:
                 print(f"[{raw_symbol}] Неизвестное действие: {action}")
                 await exchange.close()
                 return
 
+            print(f"[{raw_symbol}] Открываем {side.upper()} | Депозит: {free_usdt}$ | Маржа: {round(margin_usdt,2)}$ | Объем: {amount} SOL")
+
+            # Устанавливаем плечо перед входом
+            try:
+                await exchange.set_leverage(LEVERAGE, symbol_futures)
+            except Exception:
+                pass
+
             # 1) Вход по маркету
-            order = await exchange.create_order(
+            main_order = await exchange.create_market_order(
                 symbol=symbol_futures,
-                type='market',
-                side=order_side,
+                side=side,
                 amount=amount
             )
-            print(f"[{raw_symbol}] {action.upper()} ОТКРЫТ | Маржа: {round(margin_usdt,2)}$ | Объем: {amount}")
+            print(f"[{raw_symbol}] Позиция открыта успешно!")
 
-            # 2) Стоп-Лосс ордер
-            await exchange.create_order(
-                symbol=symbol_futures,
-                type='STOP_MARKET',
-                side=close_side,
-                amount=amount,
-                params={'stopPrice': sl_price, 'triggerPrice': sl_price, 'reduceOnly': True}
-            )
+            # Небольшая задержка, чтобы позиция зарегистрировалась на бирже
+            await asyncio.sleep(0.5)
 
-            # 3) Тейк-Профит ордер
-            await exchange.create_order(
-                symbol=symbol_futures,
-                type='TAKE_PROFIT_MARKET',
-                side=close_side,
-                amount=amount,
-                params={'stopPrice': tp_price, 'triggerPrice': tp_price, 'reduceOnly': True}
-            )
-            print(f"[{raw_symbol}] TP ({tp_price}) и SL ({sl_price}) успешно выставлены!")
+            # 2) Выставление Стоп-Лосса (через триггерный ордер MEXC)
+            try:
+                await exchange.create_order(
+                    symbol=symbol_futures,
+                    type='STOP_MARKET',
+                    side=close_side,
+                    amount=amount,
+                    params={
+                        'stopPrice': sl_price,
+                        'triggerPrice': sl_price,
+                        'planType': 'STOP_LOSS',
+                        'reduceOnly': True
+                    }
+                )
+                print(f"[{raw_symbol}] SL выставлен: {sl_price}")
+            except Exception as e_sl:
+                print(f"[{raw_symbol}] Ошибка выставления SL: {e_sl}")
+
+            # 3) Выставление Тейк-Профита
+            try:
+                await exchange.create_order(
+                    symbol=symbol_futures,
+                    type='TAKE_PROFIT_MARKET',
+                    side=close_side,
+                    amount=amount,
+                    params={
+                        'stopPrice': tp_price,
+                        'triggerPrice': tp_price,
+                        'planType': 'TAKE_PROFIT',
+                        'reduceOnly': True
+                    }
+                )
+                print(f"[{raw_symbol}] TP выставлен: {tp_price}")
+            except Exception as e_tp:
+                print(f"[{raw_symbol}] Ошибка выставления TP: {e_tp}")
 
             await exchange.close()
 
@@ -130,9 +160,13 @@ async def process_mexc_order(data: dict):
                 await exchange.close()
             print(f"[{data.get('symbol')}] Ошибка исполнения сделки: {str(e)}")
 
-        # Пауза перед проверкой следующего алерта
         await asyncio.sleep(DELAY_BETWEEN_ORDERS)
 
+def pos_info_len(p):
+    try:
+        return float(p.get('info', {}).get('holdVol', 0))
+    except Exception:
+        return 0
 
 @app.post("/webhook")
 async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -152,9 +186,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
         if not action or not raw_symbol:
             raise HTTPException(status_code=400, detail="Missing params")
 
-        # Добавляем в асинхронную очередь
         background_tasks.add_task(process_mexc_order, data)
-
         return {"status": "queued", "message": "Alert received"}
 
     except Exception as e:
@@ -163,5 +195,4 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
 
