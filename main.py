@@ -6,6 +6,10 @@ import json
 import asyncio
 
 app = FastAPI(title="Safe Single-Position MEXC Bridge")
+@app.get("/")
+@app.head("/")
+async def root():
+    return {"status": "ok"}
 
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
