@@ -25,6 +25,12 @@ DELAY_BETWEEN_ORDERS = 1.5 # Задержка в секундах между о�
 
 execution_lock = asyncio.Lock()
 
+def pos_info_len(p):
+    try:
+        return float(p.get('info', {}).get('holdVol', 0))
+    except Exception:
+        return 0
+
 async def process_mexc_order(data: dict):
     """Функция обработки ордера strictly solo (1 позиция на весь депо)"""
     async with execution_lock:
@@ -57,7 +63,7 @@ async def process_mexc_order(data: dict):
                 await asyncio.sleep(DELAY_BETWEEN_ORDERS)
                 return
 
-            # 2. Корректное получение свободного баланса USDT на фьючерсах
+            # 2. Получение свободного баланса USDT на фьючерсах
             balance = await exchange.fetch_balance({'type': 'swap'})
             usdt_data = balance.get('USDT', {})
             free_usdt = float(usdt_data.get('free') or usdt_data.get('total') or 0)
@@ -75,8 +81,6 @@ async def process_mexc_order(data: dict):
             # Расчет маржи и объема с плечом 6x
             margin_usdt = free_usdt * MARGIN_PCT
             position_size_usdt = margin_usdt * LEVERAGE
-            
-            # Конвертируем в количество SOL (минимальный шаг округления)
             amount = round(position_size_usdt / entry_price, 1)
 
             # Дистанция TP/SL по графику с учетом 6-го плеча
@@ -88,11 +92,13 @@ async def process_mexc_order(data: dict):
                 tp_price = round(entry_price * (1 + chart_tp_pct), 2)
                 side = 'buy'
                 close_side = 'sell'
+                side_code_close = 2  # Код закрытия Long позиции
             elif action == "sell":
                 sl_price = round(entry_price * (1 + chart_sl_pct), 2)
                 tp_price = round(entry_price * (1 - chart_tp_pct), 2)
                 side = 'sell'
                 close_side = 'buy'
+                side_code_close = 4  # Код закрытия Short позиции
             else:
                 print(f"[{raw_symbol}] Неизвестное действие: {action}")
                 await exchange.close()
@@ -114,39 +120,42 @@ async def process_mexc_order(data: dict):
             )
             print(f"[{raw_symbol}] Позиция открыта успешно!")
 
-            # Небольшая задержка, чтобы позиция зарегистрировалась на бирже
             await asyncio.sleep(0.5)
 
-            # 2) Выставление Стоп-Лосса (через триггерный ордер MEXC)
+            # 2) Выставление Стоп-Лосса (прямой API MEXC)
             try:
-                await exchange.create_order(
+                await exchange.create_trigger_order(
                     symbol=symbol_futures,
-                    type='STOP_MARKET',
+                    type='market',
                     side=close_side,
                     amount=amount,
+                    price=None,
                     params={
                         'stopPrice': sl_price,
                         'triggerPrice': sl_price,
+                        'type': 5,            # 5 = Market Trigger Order для MEXC
                         'planType': 'STOP_LOSS',
-                        'reduceOnly': True
+                        'openType': 1
                     }
                 )
                 print(f"[{raw_symbol}] SL выставлен: {sl_price}")
             except Exception as e_sl:
                 print(f"[{raw_symbol}] Ошибка выставления SL: {e_sl}")
 
-            # 3) Выставление Тейк-Профита
+            # 3) Выставление Тейк-Профита (прямой API MEXC)
             try:
-                await exchange.create_order(
+                await exchange.create_trigger_order(
                     symbol=symbol_futures,
-                    type='TAKE_PROFIT_MARKET',
+                    type='market',
                     side=close_side,
                     amount=amount,
+                    price=None,
                     params={
                         'stopPrice': tp_price,
                         'triggerPrice': tp_price,
+                        'type': 5,            # 5 = Market Trigger Order для MEXC
                         'planType': 'TAKE_PROFIT',
-                        'reduceOnly': True
+                        'openType': 1
                     }
                 )
                 print(f"[{raw_symbol}] TP выставлен: {tp_price}")
@@ -162,11 +171,6 @@ async def process_mexc_order(data: dict):
 
         await asyncio.sleep(DELAY_BETWEEN_ORDERS)
 
-def pos_info_len(p):
-    try:
-        return float(p.get('info', {}).get('holdVol', 0))
-    except Exception:
-        return 0
 
 @app.post("/webhook")
 async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
