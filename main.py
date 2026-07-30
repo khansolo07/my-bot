@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
-import ccxt.async_support as ccxt
-import uvicorn
-import os
-import json
 import asyncio
+import json
+import os
+import ccxt.async_support as ccxt
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+import uvicorn
 
 app = FastAPI(title="Safe Single-Position MEXC Bridge")
 
@@ -16,12 +16,11 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
 SECRET_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MYSUPERSECRETKEY123") 
 
-# Настройки Маржи, Плеча, Риска и Тейка
-MARGIN_PCT = 0.90          # Берем 90% от свободного баланса под маржу
+MARGIN_PCT = 0.90          # 90% от свободного баланса
 LEVERAGE = 6               # Плечо 6x
-TARGET_MARGIN_RISK = 0.01  # 1% риск от маржи (0.45$ при 45$ марже)
-TARGET_MARGIN_TP = 0.031   # 3.1% тейк от маржи (1.40$ при 45$ марже)
-DELAY_BETWEEN_ORDERS = 1.5 # Задержка в секундах между обработкой алертов
+TARGET_MARGIN_RISK = 0.01  # 1% риск от маржи
+TARGET_MARGIN_TP = 0.031   # 3.1% тейк от маржи
+DELAY_BETWEEN_ORDERS = 1.5
 
 execution_lock = asyncio.Lock()
 
@@ -49,7 +48,10 @@ async def process_mexc_order(data: dict):
                 'enableRateLimit': True,
             })
 
-            # 1. ПРОВЕРКА: Есть ли УЖЕ открытые позиции по аккаунту?
+            # Загружаем рынки, чтобы корректно считать точность шага (precision) и размеры контрактов
+            await exchange.load_markets()
+
+            # 1. ПРОВЕРКА: Есть ли УЖЕ открытые позиции?
             all_positions = await exchange.fetch_positions()
             
             active_positions = [
@@ -63,7 +65,7 @@ async def process_mexc_order(data: dict):
                 await asyncio.sleep(DELAY_BETWEEN_ORDERS)
                 return
 
-            # 2. Получение свободного баланса USDT на фьючерсах
+            # 2. Получение свободного баланса USDT
             balance = await exchange.fetch_balance({'type': 'swap'})
             usdt_data = balance.get('USDT', {})
             free_usdt = float(usdt_data.get('free') or usdt_data.get('total') or 0)
@@ -74,93 +76,106 @@ async def process_mexc_order(data: dict):
                 await asyncio.sleep(DELAY_BETWEEN_ORDERS)
                 return
 
-            # 3. Актуальная цена
+            # 3. Получаем цену и считаем точный объем контрактов
             ticker = await exchange.fetch_ticker(symbol_futures)
             entry_price = float(ticker['last'])
 
-            # Расчет маржи и объема с плечом 6x
             margin_usdt = free_usdt * MARGIN_PCT
             position_size_usdt = margin_usdt * LEVERAGE
-            amount = round(position_size_usdt / entry_price, 1)
 
-            # Дистанция TP/SL по графику с учетом 6-го плеча
-            chart_sl_pct = TARGET_MARGIN_RISK / LEVERAGE  # 0.166% по графику
-            chart_tp_pct = TARGET_MARGIN_TP / LEVERAGE    # 0.516% по графику
+            # Считаем количество МОНЕТ
+            raw_amount_coins = position_size_usdt / entry_price
+            
+            # Приводим к точной спецификации контрактов MEXC
+            # (на MEXC 1 контракт может быть равен 1 SOL или 0.1 SOL, amount_to_precision учтет это)
+            amount = float(exchange.amount_to_precision(symbol_futures, raw_amount_coins))
+
+            # Дистанция TP/SL по графику
+            chart_sl_pct = TARGET_MARGIN_RISK / LEVERAGE
+            chart_tp_pct = TARGET_MARGIN_TP / LEVERAGE
 
             if action == "buy":
-                sl_price = round(entry_price * (1 - chart_sl_pct), 2)
-                tp_price = round(entry_price * (1 + chart_tp_pct), 2)
+                sl_price = float(exchange.price_to_precision(symbol_futures, entry_price * (1 - chart_sl_pct)))
+                tp_price = float(exchange.price_to_precision(symbol_futures, entry_price * (1 + chart_tp_pct)))
                 side = 'buy'
                 close_side = 'sell'
-                side_code_close = 2  # Код закрытия Long позиции
             elif action == "sell":
-                sl_price = round(entry_price * (1 + chart_sl_pct), 2)
-                tp_price = round(entry_price * (1 - chart_tp_pct), 2)
+                sl_price = float(exchange.price_to_precision(symbol_futures, entry_price * (1 + chart_sl_pct)))
+                tp_price = float(exchange.price_to_precision(symbol_futures, entry_price * (1 - chart_tp_pct)))
                 side = 'sell'
                 close_side = 'buy'
-                side_code_close = 4  # Код закрытия Short позиции
             else:
                 print(f"[{raw_symbol}] Неизвестное действие: {action}")
                 await exchange.close()
                 return
 
-            print(f"[{raw_symbol}] Открываем {side.upper()} | Депозит: {free_usdt}$ | Маржа: {round(margin_usdt,2)}$ | Объем: {amount} SOL")
+            print(f"[{raw_symbol}] Открываем {side.upper()} | Свободно: {free_usdt}$ | Маржа: {round(margin_usdt,2)}$ | Объем: {amount} (контрактов)")
 
-            # Устанавливаем плечо перед входом
+            # Устанавливаем плечо
             try:
                 await exchange.set_leverage(LEVERAGE, symbol_futures)
             except Exception:
                 pass
 
-            # 1) Вход по маркету
-            main_order = await exchange.create_market_order(
-                symbol=symbol_futures,
-                side=side,
-                amount=amount
-            )
-            print(f"[{raw_symbol}] Позиция открыта успешно!")
-
-            await asyncio.sleep(0.5)
-
-            # 2) Выставление Стоп-Лосса (прямой API MEXC)
+            # 1) Открытие позиции сразу с привязанными TP/SL (встроенный механизма MEXC)
             try:
-                await exchange.create_trigger_order(
+                main_order = await exchange.create_order(
                     symbol=symbol_futures,
                     type='market',
-                    side=close_side,
+                    side=side,
                     amount=amount,
-                    price=None,
                     params={
-                        'stopPrice': sl_price,
-                        'triggerPrice': sl_price,
-                        'type': 5,            # 5 = Market Trigger Order для MEXC
-                        'planType': 'STOP_LOSS',
-                        'openType': 1
+                        'stopLossPrice': sl_price,
+                        'takeProfitPrice': tp_price
                     }
                 )
-                print(f"[{raw_symbol}] SL выставлен: {sl_price}")
-            except Exception as e_sl:
-                print(f"[{raw_symbol}] Ошибка выставления SL: {e_sl}")
-
-            # 3) Выставление Тейк-Профита (прямой API MEXC)
-            try:
-                await exchange.create_trigger_order(
+                print(f"[{raw_symbol}] Позиция открыта с TP ({tp_price}) и SL ({sl_price})!")
+            except Exception as e_main:
+                print(f"[{raw_symbol}] Ошибка открытия с встроенным TP/SL, пробуем открыть без них: {e_main}")
+                
+                # Запасной вариант: Открываем маркет, а TP/SL ставим отдельными ордерами
+                main_order = await exchange.create_market_order(
                     symbol=symbol_futures,
-                    type='market',
-                    side=close_side,
-                    amount=amount,
-                    price=None,
-                    params={
-                        'stopPrice': tp_price,
-                        'triggerPrice': tp_price,
-                        'type': 5,            # 5 = Market Trigger Order для MEXC
-                        'planType': 'TAKE_PROFIT',
-                        'openType': 1
-                    }
+                    side=side,
+                    amount=amount
                 )
-                print(f"[{raw_symbol}] TP выставлен: {tp_price}")
-            except Exception as e_tp:
-                print(f"[{raw_symbol}] Ошибка выставления TP: {e_tp}")
+                print(f"[{raw_symbol}] Позиция открыта по маркету!")
+
+                await asyncio.sleep(0.5)
+
+                # Выставление SL отдельным ордером
+                try:
+                    await exchange.create_order(
+                        symbol=symbol_futures,
+                        type='STOP_MARKET',
+                        side=close_side,
+                        amount=amount,
+                        params={
+                            'triggerPrice': sl_price,
+                            'stopPrice': sl_price,
+                            'reduceOnly': True
+                        }
+                    )
+                    print(f"[{raw_symbol}] SL выставлен: {sl_price}")
+                except Exception as e_sl:
+                    print(f"[{raw_symbol}] Ошибка выставления SL: {e_sl}")
+
+                # Выставление TP отдельным ордером
+                try:
+                    await exchange.create_order(
+                        symbol=symbol_futures,
+                        type='TAKE_PROFIT_MARKET',
+                        side=close_side,
+                        amount=amount,
+                        params={
+                            'triggerPrice': tp_price,
+                            'stopPrice': tp_price,
+                            'reduceOnly': True
+                        }
+                    )
+                    print(f"[{raw_symbol}] TP выставлен: {tp_price}")
+                except Exception as e_tp:
+                    print(f"[{raw_symbol}] Ошибка выставления TP: {e_tp}")
 
             await exchange.close()
 
