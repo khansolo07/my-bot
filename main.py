@@ -16,7 +16,7 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
 SECRET_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MYSUPERSECRETKEY123") 
 
-MARGIN_PCT = 0.90          # 90% от свободного баланса
+MARGIN_PCT = 0.97          # 97% от свободного баланса (3% запас на комиссию биржи)
 LEVERAGE = 6               # Плечо 6x
 TARGET_MARGIN_RISK = 0.01  # 1% риск от маржи
 TARGET_MARGIN_TP = 0.031   # 3.1% тейк от маржи
@@ -48,7 +48,7 @@ async def process_mexc_order(data: dict):
                 'enableRateLimit': True,
             })
 
-            # Загружаем рынки, чтобы корректно считать точность шага (precision) и размеры контрактов
+            # Загружаем рынки, чтобы корректно получить размер контракта (contractSize)
             await exchange.load_markets()
 
             # 1. ПРОВЕРКА: Есть ли УЖЕ открытые позиции?
@@ -76,19 +76,21 @@ async def process_mexc_order(data: dict):
                 await asyncio.sleep(DELAY_BETWEEN_ORDERS)
                 return
 
-            # 3. Получаем цену и считаем точный объем контрактов
+            # 3. Получаем цену, размер контракта и считаем точный объем КОНТРАКТОВ MEXC
             ticker = await exchange.fetch_ticker(symbol_futures)
             entry_price = float(ticker['last'])
+
+            market = exchange.market(symbol_futures)
+            contract_size = float(market.get('contractSize', 1.0))
 
             margin_usdt = free_usdt * MARGIN_PCT
             position_size_usdt = margin_usdt * LEVERAGE
 
-            # Считаем количество МОНЕТ
-            raw_amount_coins = position_size_usdt / entry_price
+            # Главное исправление: Объем в USDT делим на (Цену * Размер 1 контракта)
+            raw_contracts = position_size_usdt / (entry_price * contract_size)
             
-            # Приводим к точной спецификации контрактов MEXC
-            # (на MEXC 1 контракт может быть равен 1 SOL или 0.1 SOL, amount_to_precision учтет это)
-            amount = float(exchange.amount_to_precision(symbol_futures, raw_amount_coins))
+            # Приводим к разрешенной точности шага биржи
+            amount = float(exchange.amount_to_precision(symbol_futures, raw_contracts))
 
             # Дистанция TP/SL по графику
             chart_sl_pct = TARGET_MARGIN_RISK / LEVERAGE
@@ -109,7 +111,7 @@ async def process_mexc_order(data: dict):
                 await exchange.close()
                 return
 
-            print(f"[{raw_symbol}] Открываем {side.upper()} | Свободно: {free_usdt}$ | Маржа: {round(margin_usdt,2)}$ | Объем: {amount} (контрактов)")
+            print(f"[{raw_symbol}] Открываем {side.upper()} | Свободно: {free_usdt}$ | Маржа: {round(margin_usdt,2)}$ | Контрактов: {amount} (Contract Size: {contract_size})")
 
             # Устанавливаем плечо
             try:
@@ -117,7 +119,7 @@ async def process_mexc_order(data: dict):
             except Exception:
                 pass
 
-            # 1) Открытие позиции сразу с привязанными TP/SL (встроенный механизма MEXC)
+            # Открытие позиции сразу с привязанными TP/SL
             try:
                 main_order = await exchange.create_order(
                     symbol=symbol_futures,
@@ -131,7 +133,7 @@ async def process_mexc_order(data: dict):
                 )
                 print(f"[{raw_symbol}] Позиция открыта с TP ({tp_price}) и SL ({sl_price})!")
             except Exception as e_main:
-                print(f"[{raw_symbol}] Ошибка открытия с встроенным TP/SL, пробуем открыть без них: {e_main}")
+                print(f"[{raw_symbol}] Ошибка открытия с встроенным TP/SL, пробуем запасной вариант: {e_main}")
                 
                 # Запасной вариант: Открываем маркет, а TP/SL ставим отдельными ордерами
                 main_order = await exchange.create_market_order(
