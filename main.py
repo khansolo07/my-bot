@@ -17,7 +17,7 @@ MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
 SECRET_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MYSUPERSECRETKEY123") 
 
 MARGIN_PCT = 0.97          # 97% от свободного баланса (3% запас на комиссию биржи)
-LEVERAGE = 6               # Плечо 6x
+LEVERAGE = 8               # Плечо 8x
 TARGET_MARGIN_RISK = 0.01  # 1% риск от маржи
 TARGET_MARGIN_TP = 0.031   # 3.1% тейк от маржи
 DELAY_BETWEEN_ORDERS = 1.5
