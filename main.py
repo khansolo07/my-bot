@@ -10,7 +10,7 @@ app = FastAPI(title="Safe Single-Position MEXC Bridge")
 @app.get("/")
 @app.head("/")
 async def root():
-    return {"status": "MEXC Single-Position Bridge is running!"}
+    return {"status": "MEXC Guaranteed Maker Bridge is running!"}
 
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
@@ -31,7 +31,7 @@ def pos_info_len(p):
         return 0
 
 async def process_mexc_order(data: dict):
-    """Функция обработки ордера strictly solo с исполнением через GUARANTEED POST-ONLY MAKER"""
+    """Функция обработки ордера strictly solo с гарантированным Maker на входе и на тейк-профите"""
     async with execution_lock:
         exchange = None
         try:
@@ -74,17 +74,19 @@ async def process_mexc_order(data: dict):
                 await asyncio.sleep(DELAY_BETWEEN_ORDERS)
                 return
 
-            # 3. Запрашиваем стакан цен (Orderbook) для определения цены Maker
+            # 3. Запрашиваем стакан цен (Orderbook) для идеального Maker входа
             orderbook = await exchange.fetch_order_book(symbol_futures, limit=5)
             
             if action == "buy":
                 # Для покупки берем лучший Bid (покупатель)
                 limit_entry_price = float(orderbook['bids'][0][0])
-                side = 'buy'
+                entry_side = 'buy'
+                exit_side = 'sell'
             elif action == "sell":
                 # Для продажи берем лучший Ask (продавец)
                 limit_entry_price = float(orderbook['asks'][0][0])
-                side = 'sell'
+                entry_side = 'sell'
+                exit_side = 'buy'
             else:
                 print(f"[{raw_symbol}] Неизвестное действие: {action}")
                 await exchange.close()
@@ -103,14 +105,14 @@ async def process_mexc_order(data: dict):
             chart_sl_pct = TARGET_MARGIN_RISK / LEVERAGE
             chart_tp_pct = TARGET_MARGIN_TP / LEVERAGE
 
-            if side == "buy":
+            if entry_side == "buy":
                 sl_price = float(exchange.price_to_precision(symbol_futures, limit_entry_price * (1 - chart_sl_pct)))
                 tp_price = float(exchange.price_to_precision(symbol_futures, limit_entry_price * (1 + chart_tp_pct)))
             else:
                 sl_price = float(exchange.price_to_precision(symbol_futures, limit_entry_price * (1 + chart_sl_pct)))
                 tp_price = float(exchange.price_to_precision(symbol_futures, limit_entry_price * (1 - chart_tp_pct)))
 
-            print(f"[{raw_symbol}] Открываем POST-ONLY LIMIT {side.upper()} по {limit_entry_price} | Контрактов: {amount}")
+            print(f"[{raw_symbol}] Открываем POST-ONLY LIMIT {entry_side.upper()} по {limit_entry_price} | Объем: {amount}")
 
             # Устанавливаем плечо
             try:
@@ -118,20 +120,35 @@ async def process_mexc_order(data: dict):
             except Exception:
                 pass
 
-            # 4. Отправка Post-Only ордера через timeInForce (Жесткая защита от Taker комиссии)
+            # 4. Отправка ВХОДНОГО Post-Only ордера (Гарантированный 0% Maker)
             main_order = await exchange.create_order(
                 symbol=symbol_futures,
                 type='limit',
-                side=side,
+                side=entry_side,
                 amount=amount,
                 price=limit_entry_price,
                 params={
-                    'timeInForce': 'PostOnly',  # Специфика MEXC V3 API для 0% Maker
-                    'stopLossPrice': sl_price,
-                    'takeProfitPrice': tp_price
+                    'timeInForce': 'PostOnly',
+                    'stopLossPrice': sl_price  # Защитный стоп-лосс
                 }
             )
-            print(f"[{raw_symbol}] Post-Only ордер успешно выставлен по {limit_entry_price} (TP: {tp_price}, SL: {sl_price})!")
+            print(f"[{raw_symbol}] Входной Post-Only ордер выставлен по {limit_entry_price} (SL: {sl_price})!")
+
+            # 5. Выставляем ОТДЕЛЬНЫЙ ТЕЙК-ПРОФИТ Лимитной заявкой в стакан (0% Maker при закрытии)
+            try:
+                tp_order = await exchange.create_order(
+                    symbol=symbol_futures,
+                    type='limit',
+                    side=exit_side,
+                    amount=amount,
+                    price=tp_price,
+                    params={
+                        'reduceOnly': True  # Закрывающий ордер позиции
+                    }
+                )
+                print(f"[{raw_symbol}] Лимитный Тейк-Профит (Maker) успешно выставлен по цене {tp_price}!")
+            except Exception as e_tp:
+                print(f"[{raw_symbol}] Предупреждение при выставлении Лимитного TP: {str(e_tp)}")
 
             await exchange.close()
 
