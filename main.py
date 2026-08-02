@@ -16,7 +16,7 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
 SECRET_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MYSUPERSECRETKEY123") 
 
-MARGIN_PCT = 0.97          # 97% от свободного баланса (3% запас на комиссию биржи)
+MARGIN_PCT = 0.97          # 97% от свободного баланса
 LEVERAGE = 8               # Плечо 8x
 TARGET_MARGIN_RISK = 0.01  # 1% риск от маржи
 TARGET_MARGIN_TP = 0.031   # 3.1% тейк от маржи
@@ -31,7 +31,7 @@ def pos_info_len(p):
         return 0
 
 async def process_mexc_order(data: dict):
-    """Функция обработки ордера strictly solo (1 позиция на весь депо)"""
+    """Функция обработки ордера strictly solo с исполнением через LIMIT (0% Maker Fee)"""
     async with execution_lock:
         exchange = None
         try:
@@ -48,12 +48,10 @@ async def process_mexc_order(data: dict):
                 'enableRateLimit': True,
             })
 
-            # Загружаем рынки, чтобы корректно получить размер контракта (contractSize)
             await exchange.load_markets()
 
             # 1. ПРОВЕРКА: Есть ли УЖЕ открытые позиции?
             all_positions = await exchange.fetch_positions()
-            
             active_positions = [
                 p for p in all_positions 
                 if float(p.get('contracts', 0) or pos_info_len(p)) > 0
@@ -76,34 +74,17 @@ async def process_mexc_order(data: dict):
                 await asyncio.sleep(DELAY_BETWEEN_ORDERS)
                 return
 
-            # 3. Получаем цену, размер контракта и считаем точный объем КОНТРАКТОВ MEXC
-            ticker = await exchange.fetch_ticker(symbol_futures)
-            entry_price = float(ticker['last'])
-
-            market = exchange.market(symbol_futures)
-            contract_size = float(market.get('contractSize', 1.0))
-
-            margin_usdt = free_usdt * MARGIN_PCT
-            position_size_usdt = margin_usdt * LEVERAGE
-
-            # Главное исправление: Объем в USDT делим на (Цену * Размер 1 контракта)
-            raw_contracts = position_size_usdt / (entry_price * contract_size)
+            # 3. Запрашиваем стакан цен (Orderbook) для определения лучшей цены Maker
+            orderbook = await exchange.fetch_order_book(symbol_futures, limit=5)
             
-            # Приводим к разрешенной точности шага биржи
-            amount = float(exchange.amount_to_precision(symbol_futures, raw_contracts))
-
-            # Дистанция TP/SL по графику
-            chart_sl_pct = TARGET_MARGIN_RISK / LEVERAGE
-            chart_tp_pct = TARGET_MARGIN_TP / LEVERAGE
-
             if action == "buy":
-                sl_price = float(exchange.price_to_precision(symbol_futures, entry_price * (1 - chart_sl_pct)))
-                tp_price = float(exchange.price_to_precision(symbol_futures, entry_price * (1 + chart_tp_pct)))
+                # Для покупки берём лучший Bid (покупатель) -> станем Мейкером
+                limit_entry_price = float(orderbook['bids'][0][0])
                 side = 'buy'
                 close_side = 'sell'
             elif action == "sell":
-                sl_price = float(exchange.price_to_precision(symbol_futures, entry_price * (1 + chart_sl_pct)))
-                tp_price = float(exchange.price_to_precision(symbol_futures, entry_price * (1 - chart_tp_pct)))
+                # Для продажи берём лучший Ask (продавец) -> станем Мейкером
+                limit_entry_price = float(orderbook['asks'][0][0])
                 side = 'sell'
                 close_side = 'buy'
             else:
@@ -111,7 +92,27 @@ async def process_mexc_order(data: dict):
                 await exchange.close()
                 return
 
-            print(f"[{raw_symbol}] Открываем {side.upper()} | Свободно: {free_usdt}$ | Маржа: {round(margin_usdt,2)}$ | Контрактов: {amount} (Contract Size: {contract_size})")
+            market = exchange.market(symbol_futures)
+            contract_size = float(market.get('contractSize', 1.0))
+
+            margin_usdt = free_usdt * MARGIN_PCT
+            position_size_usdt = margin_usdt * LEVERAGE
+
+            raw_contracts = position_size_usdt / (limit_entry_price * contract_size)
+            amount = float(exchange.amount_to_precision(symbol_futures, raw_contracts))
+
+            # Расчет TP/SL от цены лимитного входа
+            chart_sl_pct = TARGET_MARGIN_RISK / LEVERAGE
+            chart_tp_pct = TARGET_MARGIN_TP / LEVERAGE
+
+            if side == "buy":
+                sl_price = float(exchange.price_to_precision(symbol_futures, limit_entry_price * (1 - chart_sl_pct)))
+                tp_price = float(exchange.price_to_precision(symbol_futures, limit_entry_price * (1 + chart_tp_pct)))
+            else:
+                sl_price = float(exchange.price_to_precision(symbol_futures, limit_entry_price * (1 + chart_sl_pct)))
+                tp_price = float(exchange.price_to_precision(symbol_futures, limit_entry_price * (1 - chart_tp_pct)))
+
+            print(f"[{raw_symbol}] Открываем LIMIT {side.upper()} по {limit_entry_price} | Контрактов: {amount}")
 
             # Устанавливаем плечо
             try:
@@ -119,65 +120,19 @@ async def process_mexc_order(data: dict):
             except Exception:
                 pass
 
-            # Открытие позиции сразу с привязанными TP/SL
-            try:
-                main_order = await exchange.create_order(
-                    symbol=symbol_futures,
-                    type='market',
-                    side=side,
-                    amount=amount,
-                    params={
-                        'stopLossPrice': sl_price,
-                        'takeProfitPrice': tp_price
-                    }
-                )
-                print(f"[{raw_symbol}] Позиция открыта с TP ({tp_price}) и SL ({sl_price})!")
-            except Exception as e_main:
-                print(f"[{raw_symbol}] Ошибка открытия с встроенным TP/SL, пробуем запасной вариант: {e_main}")
-                
-                # Запасной вариант: Открываем маркет, а TP/SL ставим отдельными ордерами
-                main_order = await exchange.create_market_order(
-                    symbol=symbol_futures,
-                    side=side,
-                    amount=amount
-                )
-                print(f"[{raw_symbol}] Позиция открыта по маркету!")
-
-                await asyncio.sleep(0.5)
-
-                # Выставление SL отдельным ордером
-                try:
-                    await exchange.create_order(
-                        symbol=symbol_futures,
-                        type='STOP_MARKET',
-                        side=close_side,
-                        amount=amount,
-                        params={
-                            'triggerPrice': sl_price,
-                            'stopPrice': sl_price,
-                            'reduceOnly': True
-                        }
-                    )
-                    print(f"[{raw_symbol}] SL выставлен: {sl_price}")
-                except Exception as e_sl:
-                    print(f"[{raw_symbol}] Ошибка выставления SL: {e_sl}")
-
-                # Выставление TP отдельным ордером
-                try:
-                    await exchange.create_order(
-                        symbol=symbol_futures,
-                        type='TAKE_PROFIT_MARKET',
-                        side=close_side,
-                        amount=amount,
-                        params={
-                            'triggerPrice': tp_price,
-                            'stopPrice': tp_price,
-                            'reduceOnly': True
-                        }
-                    )
-                    print(f"[{raw_symbol}] TP выставлен: {tp_price}")
-                except Exception as e_tp:
-                    print(f"[{raw_symbol}] Ошибка выставления TP: {e_tp}")
+            # 4. Отправка LIMIT ордера (Post-Only логика через цену стакана)
+            main_order = await exchange.create_order(
+                symbol=symbol_futures,
+                type='limit',
+                side=side,
+                amount=amount,
+                price=limit_entry_price,
+                params={
+                    'stopLossPrice': sl_price,
+                    'takeProfitPrice': tp_price
+                }
+            )
+            print(f"[{raw_symbol}] Лимитный ордер размещен по цене {limit_entry_price} с TP ({tp_price}) и SL ({sl_price})!")
 
             await exchange.close()
 
