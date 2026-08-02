@@ -31,7 +31,7 @@ def pos_info_len(p):
         return 0
 
 async def process_mexc_order(data: dict):
-    """Функция обработки ордера strictly solo с исполнением через GUARANTEED MAKER (postOnly = True)"""
+    """Функция обработки ордера strictly solo с исполнением через GUARANTEED POST-ONLY MAKER"""
     async with execution_lock:
         exchange = None
         try:
@@ -118,7 +118,7 @@ async def process_mexc_order(data: dict):
             except Exception:
                 pass
 
-            # 4. Отправка LIMIT Post-Only ордера (Гарантированный Мейкер / 0% комиссии)
+            # 4. Отправка Post-Only ордера через timeInForce (Жесткая защита от Taker комиссии)
             main_order = await exchange.create_order(
                 symbol=symbol_futures,
                 type='limit',
@@ -126,12 +126,12 @@ async def process_mexc_order(data: dict):
                 amount=amount,
                 price=limit_entry_price,
                 params={
-                    'postOnly': True,  # Принудительно исполнять как Maker (0% Fee)
+                    'timeInForce': 'PostOnly',  # Специфика MEXC V3 API для 0% Maker
                     'stopLossPrice': sl_price,
                     'takeProfitPrice': tp_price
                 }
             )
-            print(f"[{raw_symbol}] Лимитный Post-Only ордер размещен по цене {limit_entry_price} (TP: {tp_price}, SL: {sl_price})!")
+            print(f"[{raw_symbol}] Post-Only ордер успешно выставлен по {limit_entry_price} (TP: {tp_price}, SL: {sl_price})!")
 
             await exchange.close()
 
