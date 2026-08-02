@@ -31,7 +31,7 @@ def pos_info_len(p):
         return 0
 
 async def process_mexc_order(data: dict):
-    """Функция обработки ордера strictly solo с исполнением через LIMIT (0% Maker Fee)"""
+    """Функция обработки ордера strictly solo с исполнением через GUARANTEED MAKER (postOnly = True)"""
     async with execution_lock:
         exchange = None
         try:
@@ -74,19 +74,17 @@ async def process_mexc_order(data: dict):
                 await asyncio.sleep(DELAY_BETWEEN_ORDERS)
                 return
 
-            # 3. Запрашиваем стакан цен (Orderbook) для определения лучшей цены Maker
+            # 3. Запрашиваем стакан цен (Orderbook) для определения цены Maker
             orderbook = await exchange.fetch_order_book(symbol_futures, limit=5)
             
             if action == "buy":
-                # Для покупки берём лучший Bid (покупатель) -> станем Мейкером
+                # Для покупки берем лучший Bid (покупатель)
                 limit_entry_price = float(orderbook['bids'][0][0])
                 side = 'buy'
-                close_side = 'sell'
             elif action == "sell":
-                # Для продажи берём лучший Ask (продавец) -> станем Мейкером
+                # Для продажи берем лучший Ask (продавец)
                 limit_entry_price = float(orderbook['asks'][0][0])
                 side = 'sell'
-                close_side = 'buy'
             else:
                 print(f"[{raw_symbol}] Неизвестное действие: {action}")
                 await exchange.close()
@@ -112,7 +110,7 @@ async def process_mexc_order(data: dict):
                 sl_price = float(exchange.price_to_precision(symbol_futures, limit_entry_price * (1 + chart_sl_pct)))
                 tp_price = float(exchange.price_to_precision(symbol_futures, limit_entry_price * (1 - chart_tp_pct)))
 
-            print(f"[{raw_symbol}] Открываем LIMIT {side.upper()} по {limit_entry_price} | Контрактов: {amount}")
+            print(f"[{raw_symbol}] Открываем POST-ONLY LIMIT {side.upper()} по {limit_entry_price} | Контрактов: {amount}")
 
             # Устанавливаем плечо
             try:
@@ -120,7 +118,7 @@ async def process_mexc_order(data: dict):
             except Exception:
                 pass
 
-            # 4. Отправка LIMIT ордера (Post-Only логика через цену стакана)
+            # 4. Отправка LIMIT Post-Only ордера (Гарантированный Мейкер / 0% комиссии)
             main_order = await exchange.create_order(
                 symbol=symbol_futures,
                 type='limit',
@@ -128,11 +126,12 @@ async def process_mexc_order(data: dict):
                 amount=amount,
                 price=limit_entry_price,
                 params={
+                    'postOnly': True,  # Принудительно исполнять как Maker (0% Fee)
                     'stopLossPrice': sl_price,
                     'takeProfitPrice': tp_price
                 }
             )
-            print(f"[{raw_symbol}] Лимитный ордер размещен по цене {limit_entry_price} с TP ({tp_price}) и SL ({sl_price})!")
+            print(f"[{raw_symbol}] Лимитный Post-Only ордер размещен по цене {limit_entry_price} (TP: {tp_price}, SL: {sl_price})!")
 
             await exchange.close()
 
