@@ -1,13 +1,13 @@
 import os
 import json
+import time
 from typing import Optional, List, Dict
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-app = FastAPI(title="MT5 TradingView Webhook Bridge")
+app = FastAPI(title="MT4/MT5 TradingView Webhook Bridge")
 
-# Разрешаем все заголовки и методы
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,24 +16,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Секретный пароль из переменных окружения Render (по умолчанию MYSUPERSECRETKEY123)
 SECRET_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "MYSUPERSECRETKEY123")
 
-# Очередь сигналов в оперативной памяти сервера (FIFO)
+# ==================== НАСТРОЙКИ ФИЛЬТРАЦИИ ====================
+# 1. Время жизни сигнала в секундах (если робот был выключен)
+MAX_SIGNAL_AGE_SECONDS = 120.0  # 2 минуты
+
+# 2. Минимальный интервал между алертами по одной валютной паре
+# Все алерты, пришедшие раньше этого времени после первого, БУДУТ ИГНОРИРОВАТЬСЯ.
+MIN_ALERT_INTERVAL_SECONDS = 60.0  # 60 секунд (поставить 60, если нужно)
+# ==============================================================
+
 signal_queue: List[Dict] = []
+# Хранит время последнего принятого алерта для каждого символа (например, "BTCUSD")
+last_alert_times: Dict[str, float] = {}
 
 @app.get("/")
 @app.head("/")
 async def root():
     return {
         "status": "online",
-        "message": "MT5 Webhook Bridge is running!",
+        "message": "MT4/MT5 Webhook Bridge is running!",
         "pending_signals": len(signal_queue)
     }
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
-    """Принимает вебхук от TradingView и сохраняет его в очередь"""
+    """Принимает вебхук от TradingView с защитой от частых повторов"""
+    global signal_queue, last_alert_times
     try:
         body_bytes = await request.body()
         if not body_bytes:
@@ -41,7 +51,6 @@ async def receive_webhook(request: Request):
         
         data = json.loads(body_bytes.decode('utf-8'))
         
-        # Проверка секретного ключа
         passphrase = data.get("passphrase") or data.get("pass")
         if SECRET_PASSPHRASE and passphrase != SECRET_PASSPHRASE:
             raise HTTPException(status_code=403, detail="Forbidden: Invalid passphrase")
@@ -52,21 +61,38 @@ async def receive_webhook(request: Request):
         if not action or not symbol:
             raise HTTPException(status_code=400, detail="Missing required parameters: action or symbol")
 
-        # Формируем объект сигнала под MT5
+        current_time = time.time()
+
+        # ПРОВЕРКА НА ДУБЛИКАТЫ И ЧАСТЫЕ АЛЕРТЫ:
+        last_time = last_alert_times.get(symbol, 0.0)
+        time_diff = current_time - last_time
+
+        # Если с момента последнего алерта прошло меньше MIN_ALERT_INTERVAL_SECONDS — сбрасываем
+        if time_diff < MIN_ALERT_INTERVAL_SECONDS:
+            left_sec = int(MIN_ALERT_INTERVAL_SECONDS - time_diff)
+            print(f"[-] Повторный алерт {action} {symbol} отсечен! Прошло всего {int(time_diff)} сек.")
+            return {
+                "status": "ignored", 
+                "message": f"Alert throttled. Cooldown active for {left_sec}s"
+            }
+
+        # Фиксируем время успешного приема алерта
+        last_alert_times[symbol] = current_time
+
         signal = {
             "symbol": symbol,
-            "action": action,         # "buy" или "sell"
+            "action": action,
             "price": data.get("price", 0),
-            "sl": data.get("sl", 0),  # Уровень SL
-            "tp": data.get("tp", 0),  # Уровень TP
-            "volume": data.get("volume", 0.01) # Лот (по умолчанию 0.01)
+            "sl": data.get("sl", 0),
+            "tp": data.get("tp", 0),
+            "volume": data.get("volume", 0.01),
+            "created_at": current_time
         }
 
-        # Добавляем в очередь
         signal_queue.append(signal)
-        print(f"[+] Новое оповещение в очереди: {signal}")
+        print(f"[+] Первый алерт принят: {action} {symbol}")
 
-        return {"status": "success", "message": "Signal queued for MT5"}
+        return {"status": "success", "message": "Signal queued"}
 
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON format")
@@ -78,10 +104,10 @@ async def receive_webhook(request: Request):
 
 @app.api_route("/signal", methods=["GET", "POST"])
 async def get_signal(request: Request, passphrase: Optional[str] = Query(None)):
-    """Принимает запросы от советника MT5 (поддерживает и GET, и POST)"""
-    req_passphrase = passphrase
+    """Выдает актуальные сигналы советнику MT4/MT5"""
+    global signal_queue
     
-    # Если запрос пришел методом POST, пробуем достать passphrase из JSON
+    req_passphrase = passphrase
     if request.method == "POST":
         try:
             body = await request.json()
@@ -93,13 +119,28 @@ async def get_signal(request: Request, passphrase: Optional[str] = Query(None)):
     if SECRET_PASSPHRASE and req_passphrase != SECRET_PASSPHRASE:
         raise HTTPException(status_code=403, detail="Forbidden: Invalid passphrase")
 
-    # Если очереди сигналов нет — отдаем статус none
+    current_time = time.time()
+
+    # 1. Фильтруем просроченные сигналы (если робот был выключен)
+    valid_signals = []
+    for sig in signal_queue:
+        age = current_time - sig.get("created_at", 0)
+        if age <= MAX_SIGNAL_AGE_SECONDS:
+            valid_signals.append(sig)
+        else:
+            print(f"[-] Просроченный сигнал удален из очереди (возраст {int(age)} сек): {sig['action']} {sig['symbol']}")
+    
+    signal_queue = valid_signals
+
+    # 2. Если очередь пуста — отдаем "none"
     if not signal_queue:
         return {"action": "none"}
 
-    # Забираем самый старый сигнал (FIFO) и сразу удаляем из очереди
+    # 3. Достаем первый сигнал из очереди
     signal = signal_queue.pop(0)
-    print(f"[-] Сигнал отдан советнику MT5: {signal}")
+    signal.pop("created_at", None)
+    
+    print(f"[-] Сигнал отдан советнику: {signal}")
     return signal
 
 if __name__ == "__main__":
